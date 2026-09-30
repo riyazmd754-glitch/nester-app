@@ -5,6 +5,7 @@ import numpy as np
 from shapely.geometry import Polygon, LineString, Point
 from shapely.ops import polygonize, unary_union
 from shapely.affinity import translate, rotate
+from shapely.prepared import prep
 import matplotlib.pyplot as plt
 import tempfile
 import os
@@ -114,8 +115,8 @@ sheet_w = st.sidebar.number_input("Sheet Width (mm)", value=2500.0)
 sheet_h = st.sidebar.number_input("Sheet Height (mm)", value=1250.0)
 spacing = st.sidebar.number_input("Part Spacing (mm)", value=3.0)
 margin = st.sidebar.number_input("Edge Margin (mm)", value=5.0)
-rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=8) # Increased defaults for better fit
-coarse_res = st.sidebar.number_input("Grid Resolution", value=10.0) # Lowered for tighter interlock scanning
+rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=4)
+coarse_res = st.sidebar.number_input("Grid Resolution", value=25.0)
 
 uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
 
@@ -182,7 +183,6 @@ if uploaded_file is not None:
                         current_attempt = placed_total_count + 1
                         display_num = min(current_attempt, total_parts_requested)
                         progress_text.text(f"Nesting Part {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
-                        
                         pct = int(min(100, max(0, (display_num / total_parts_requested) * 100)))
                         progress_bar.progress(pct)
                         
@@ -212,10 +212,10 @@ if uploaded_file is not None:
                                     collision = False
                                     for placed in placed_on_this_sheet:
                                         if bounds_overlap(cand_bounds, placed['bounds']):
-                                            if translate(r_outer, xoff=x, yoff=y).intersects(placed['buffered']):
+                                            # HIGH-SPEED INDEX CHECK (PREP)
+                                            if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        # UPGRADED: Gravity packing forces pieces into empty valleys
                                         score = y + x 
                                         if score < coarse_score:
                                             coarse_score = score
@@ -234,10 +234,10 @@ if uploaded_file is not None:
                                         collision = False
                                         for placed in placed_on_this_sheet:
                                             if bounds_overlap(cand_bounds, placed['bounds']):
-                                                if translate(r_outer, xoff=fx, yoff=fy).intersects(placed['buffered']):
+                                                # HIGH-SPEED INDEX CHECK (PREP)
+                                                if placed['prep_buffered'].intersects(translate(r_outer, xoff=fx, yoff=fy)):
                                                     collision = True; break
                                         if not collision:
-                                            # UPGRADED: Fine Gravity packing
                                             score = fy + fx 
                                             if score < best_score:
                                                 best_score = score
@@ -249,7 +249,8 @@ if uploaded_file is not None:
                             buffered = best_outer.buffer(spacing)
                             placed_on_this_sheet.append({
                                 'outer': best_outer, 'inners': best_inners,
-                                'buffered': buffered, 'bounds': buffered.bounds
+                                'buffered': buffered, 'bounds': buffered.bounds,
+                                'prep_buffered': prep(buffered) # COMPILES SHAPE TO C++ SPATIAL INDEX FOR EXTREME SPEED
                             })
                             max_search_y = max(max_search_y, buffered.bounds[3])
                             sheet_is_empty = False
@@ -266,6 +267,7 @@ if uploaded_file is not None:
                 progress_text.text(f"Done in {elapsed:.2f}s! Nested across {len(all_sheets_data)} sheet(s).")
                 
                 # Plot Results
+                st.session_state.plot_figures = []
                 for sheet_idx, sheet_parts in enumerate(all_sheets_data):
                     fig, ax = plt.subplots(figsize=(10, (sheet_h/sheet_w)*10))
                     ax.set_xlim(0, sheet_w)
@@ -288,9 +290,9 @@ if uploaded_file is not None:
                                 ax.fill(ix, iy, color='#111')
                             
                     plt.title(f"Sheet {sheet_idx + 1} ({len(sheet_parts)} parts)", color='white')
-                    st.pyplot(fig)
+                    st.session_state.plot_figures.append(fig)
                 
-                # Generate DXF memory buffer (Using text stream to prevent crashes)
+                # Generate DXF memory buffer
                 out_doc = ezdxf.new(dxfversion='R2010')
                 out_doc.header['$INSUNITS'] = 4 
                 out_doc.header['$MEASUREMENT'] = 1 
@@ -309,14 +311,22 @@ if uploaded_file is not None:
                             elif final_inner.geom_type in ['LineString', 'LinearRing']:
                                 msp.add_lwpolyline(list(final_inner.coords), dxfattribs={'color': 7})
                 
-                # CRITICAL FIX: Use StringIO instead of BytesIO
                 buffer = io.StringIO()
                 out_doc.write(buffer)
                 
-                st.download_button(
-                    label="⬇️ Download Nested DXF",
-                    data=buffer.getvalue(),
-                    file_name="nested_result.dxf",
-                    mime="application/dxf",
-                    type="primary"
-                )
+                # CACHE THE RESULTS SO THEY DON'T DISAPPEAR
+                st.session_state.dxf_output = buffer.getvalue()
+
+        # ALWAYS SHOW PLOTS AND DOWNLOAD BUTTON IF THEY EXIST IN MEMORY
+        if "plot_figures" in st.session_state:
+            for fig in st.session_state.plot_figures:
+                st.pyplot(fig)
+                
+        if "dxf_output" in st.session_state:
+            st.download_button(
+                label="⬇️ Download Nested DXF",
+                data=st.session_state.dxf_output,
+                file_name="nested_result.dxf",
+                mime="application/dxf",
+                type="primary"
+            )
