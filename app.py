@@ -15,7 +15,6 @@ st.set_page_config(page_title="High-Speed Server Nester", layout="wide")
 
 # --- CORE LOGIC ---
 def extract_smart_parts(file_bytes):
-    # Safely handle DXF encodings by letting ezdxf read from a physical temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -36,7 +35,7 @@ def extract_smart_parts(file_bytes):
             if entity.closed:
                 lines_and_arcs.append(LineString([pts[-1], pts[0]]))
                 
-    # 2. Universal Extractor: Lines, Arcs, Splines, Ellipses
+    # 2. Lines, Arcs, Splines, Ellipses
     for entity in msp.query('LINE ARC SPLINE ELLIPSE'):
         try:
             p = path.make_path(entity)
@@ -61,7 +60,6 @@ def extract_smart_parts(file_bytes):
     formed_polys = list(polygonize(merged_lines))
     all_polys = formed_polys + circles
 
-    # Destructive Frame Filter removed. The UI will safely set oversized frames to Qty 0.
     clean_polys = [p.simplify(0.2, preserve_topology=True) for p in all_polys]
     clean_polys.sort(key=lambda x: x.area, reverse=True)
     
@@ -172,10 +170,11 @@ if uploaded_file is not None:
                 start_time = time.time()
                 all_sheets_data = []
                 unplaced_parts = expanded_parts.copy()
-                total_parts = len(unplaced_parts)
-                parts_placed = 0
+                total_parts_requested = len(unplaced_parts)
+                placed_total_count = 0
 
                 while unplaced_parts:
+                    current_sheet_idx = len(all_sheets_data) + 1
                     placed_on_this_sheet = []
                     failed_parts = []
                     max_search_y = 0.0 
@@ -184,9 +183,13 @@ if uploaded_file is not None:
                     angles = [i * (360.0 / rotations) for i in range(rotations)]
                     
                     for idx, part in enumerate(unplaced_parts):
-                        parts_placed += 1
-                        progress_text.text(f"Calculating Part {parts_placed} of {total_parts} on Sheet {len(all_sheets_data)+1}...")
-                        progress_bar.progress(int((parts_placed / total_parts) * 100))
+                        current_attempt = placed_total_count + 1
+                        display_num = min(current_attempt, total_parts_requested)
+                        progress_text.text(f"Nesting Part {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
+                        
+                        # Guard: progress value strictly clamped between 0 and 100
+                        pct = int(min(100, max(0, (display_num / total_parts_requested) * 100)))
+                        progress_bar.progress(pct)
                         
                         best_score = float('inf')
                         best_outer = None
@@ -253,6 +256,7 @@ if uploaded_file is not None:
                             })
                             max_search_y = max(max_search_y, buffered.bounds[3])
                             sheet_is_empty = False
+                            placed_total_count += 1
                         else:
                             failed_parts.append(part)
 
@@ -260,8 +264,9 @@ if uploaded_file is not None:
                     all_sheets_data.append(placed_on_this_sheet)
                     unplaced_parts = failed_parts
 
+                progress_bar.progress(100)
                 elapsed = time.time() - start_time
-                progress_text.text(f"Done in {elapsed:.2f}s! Generating visual layouts and DXF...")
+                progress_text.text(f"Done in {elapsed:.2f}s! Nested across {len(all_sheets_data)} sheet(s).")
                 
                 # Plot Results
                 for sheet_idx, sheet_parts in enumerate(all_sheets_data):
@@ -286,7 +291,7 @@ if uploaded_file is not None:
                                 ax.plot(ix, iy, color='#111')
                                 ax.fill(ix, iy, color='#111')
                             
-                    plt.title(f"Sheet {sheet_idx + 1}", color='white')
+                    plt.title(f"Sheet {sheet_idx + 1} ({len(sheet_parts)} parts)", color='white')
                     st.pyplot(fig)
                 
                 # Generate DXF memory buffer
