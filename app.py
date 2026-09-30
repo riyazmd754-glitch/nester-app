@@ -104,6 +104,39 @@ def extract_smart_parts(file_bytes):
         
     return parts
 
+def generate_part_thumbnail(part):
+    """Generates a small image thumbnail of the master part for the sidebar."""
+    fig, ax = plt.subplots(figsize=(2.5, 2.5))
+    ax.set_facecolor('#2d2d2d')
+    fig.patch.set_facecolor('#2d2d2d')
+    
+    # Draw outer boundary
+    x, y = part['outer'].exterior.xy
+    ax.plot(x, y, color='#4daafc', linewidth=1.5)
+    ax.fill(x, y, alpha=0.3, color='#4daafc')
+    
+    # Draw internal holes/cutouts
+    for inner in part['inners']:
+        if inner.geom_type == 'Polygon':
+            ix, iy = inner.exterior.xy
+            ax.plot(ix, iy, color='#111', linewidth=1)
+            ax.fill(ix, iy, color='#111')
+        elif inner.geom_type in ['LineString', 'LinearRing']:
+            ix, iy = inner.xy
+            ax.plot(ix, iy, color='#ff4444', linewidth=1)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_color('#444')
+        
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
 def bounds_overlap(b1, b2):
     return not (b1[2] <= b2[0] or b1[0] >= b2[2] or b1[3] <= b2[1] or b1[1] >= b2[3])
 
@@ -138,7 +171,8 @@ if uploaded_file is not None:
         usable_h = sheet_h - (margin * 2)
         
         quantities = {}
-        st.sidebar.subheader("Quantities")
+        st.sidebar.subheader("Detected Parts & Quantities")
+        
         for i, part in enumerate(parts):
             minx, miny, maxx, maxy = part['outer'].bounds
             w, h = round(maxx - minx, 1), round(maxy - miny, 1)
@@ -146,17 +180,20 @@ if uploaded_file is not None:
             fits = (w <= usable_w and h <= usable_h) or (h <= usable_w and w <= usable_h)
             default_qty = 1 if fits else 0
             
+            # Display Thumbnail in Sidebar
+            st.sidebar.image(generate_part_thumbnail(part), use_container_width=True)
+            
             label = f"Part {i+1} ({w} x {h} mm)"
             if not fits: label += " ⚠️ Exceeds Sheet"
             
             quantities[i] = st.sidebar.number_input(label, value=default_qty, min_value=0, key=f"qty_{i}")
+            st.sidebar.markdown("---")
             
         if st.sidebar.button("2. Run Server Nest", use_container_width=True):
             expanded_parts = []
             for i, part in enumerate(parts):
                 for _ in range(quantities[i]): expanded_parts.append(part)
                 
-            # Sort parts by perimeter/area ratio to group similar aspect ratios together into clean blocks
             expanded_parts.sort(key=lambda p: (p['outer'].bounds[2] - p['outer'].bounds[0]) * (p['outer'].bounds[3] - p['outer'].bounds[1]), reverse=True)
             
             if not expanded_parts:
@@ -205,7 +242,6 @@ if uploaded_file is not None:
                             coarse_best_x, coarse_best_y = None, None
                             coarse_score = float('inf')
 
-                            # SKYLINE RECTANGLE PACKER: Scans grid prioritizing low elevations and left columns
                             for x in np.arange(0, usable_w - part_w + 1, coarse_res):
                                 for y in np.arange(0, usable_h - part_h + 1, coarse_res):
                                     cand_bounds = (x, y, x + part_w, y + part_h)
@@ -215,7 +251,6 @@ if uploaded_file is not None:
                                             if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        # STRICT RECTANGULAR BLOCK SCORING: Forces compact columns, isolating waste to a single right-side block
                                         score = (x * 3.0) + y 
                                         if score < coarse_score:
                                             coarse_score = score
@@ -245,9 +280,10 @@ if uploaded_file is not None:
                         if best_outer:
                             buffered = best_outer.buffer(spacing)
                             placed_on_this_sheet.append({
-                                'outer': best_outer, 'inners': best_inners,
+                                'outer': best_outer, 'inners': inner_poly if 'inner_poly' in locals() else best_inners,
                                 'buffered': buffered, 'bounds': buffered.bounds,
-                                'prep_buffered': prep(buffered)
+                                'prep_buffered': prep(buffered),
+                                'inners': best_inners
                             })
                             sheet_is_empty = False
                             placed_total_count += 1
