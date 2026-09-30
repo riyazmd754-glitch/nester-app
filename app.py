@@ -27,7 +27,6 @@ def extract_smart_parts(file_bytes):
     msp = doc.modelspace()
     lines_and_arcs = []
     
-    # 1. Standard LWPOLYLINEs
     for entity in msp.query('LWPOLYLINE'):
         pts = [(round(p[0], 3), round(p[1], 3)) for p in entity.get_points('xy')]
         if len(pts) > 1:
@@ -35,7 +34,6 @@ def extract_smart_parts(file_bytes):
             if entity.closed:
                 lines_and_arcs.append(LineString([pts[-1], pts[0]]))
                 
-    # 2. Lines, Arcs, Splines, Ellipses
     for entity in msp.query('LINE ARC SPLINE ELLIPSE'):
         try:
             p = path.make_path(entity)
@@ -46,7 +44,6 @@ def extract_smart_parts(file_bytes):
         except:
             pass
                 
-    # 3. Gather Circles
     circles = []
     for circle in msp.query('CIRCLE'):
         center = circle.dxf.center
@@ -74,7 +71,6 @@ def extract_smart_parts(file_bytes):
                 break
         if not is_boundary: loose_lines.append(line)
 
-    # 4. Spatial Grouping
     parts = []
     assigned = set()
     
@@ -118,8 +114,8 @@ sheet_w = st.sidebar.number_input("Sheet Width (mm)", value=2500.0)
 sheet_h = st.sidebar.number_input("Sheet Height (mm)", value=1250.0)
 spacing = st.sidebar.number_input("Part Spacing (mm)", value=3.0)
 margin = st.sidebar.number_input("Edge Margin (mm)", value=5.0)
-rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=4)
-coarse_res = st.sidebar.number_input("Grid Resolution", value=25.0)
+rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=8) # Increased defaults for better fit
+coarse_res = st.sidebar.number_input("Grid Resolution", value=10.0) # Lowered for tighter interlock scanning
 
 uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
 
@@ -187,7 +183,6 @@ if uploaded_file is not None:
                         display_num = min(current_attempt, total_parts_requested)
                         progress_text.text(f"Nesting Part {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
                         
-                        # Guard: progress value strictly clamped between 0 and 100
                         pct = int(min(100, max(0, (display_num / total_parts_requested) * 100)))
                         progress_bar.progress(pct)
                         
@@ -220,7 +215,8 @@ if uploaded_file is not None:
                                             if translate(r_outer, xoff=x, yoff=y).intersects(placed['buffered']):
                                                 collision = True; break
                                     if not collision:
-                                        score = (y * sheet_w) + x
+                                        # UPGRADED: Gravity packing forces pieces into empty valleys
+                                        score = y + x 
                                         if score < coarse_score:
                                             coarse_score = score
                                             coarse_best_x, coarse_best_y = x, y
@@ -241,7 +237,8 @@ if uploaded_file is not None:
                                                 if translate(r_outer, xoff=fx, yoff=fy).intersects(placed['buffered']):
                                                     collision = True; break
                                         if not collision:
-                                            score = (fy * sheet_w) + fx
+                                            # UPGRADED: Fine Gravity packing
+                                            score = fy + fx 
                                             if score < best_score:
                                                 best_score = score
                                                 best_outer = translate(r_outer, xoff=fx, yoff=fy)
@@ -276,7 +273,6 @@ if uploaded_file is not None:
                     ax.set_facecolor('#1e1e1e')
                     fig.patch.set_facecolor('#1e1e1e')
                     
-                    # Sheet bounds
                     ax.plot([margin, sheet_w-margin, sheet_w-margin, margin, margin], 
                             [margin, margin, sheet_h-margin, sheet_h-margin, margin], 
                             color='#555', linestyle='dashed')
@@ -294,7 +290,7 @@ if uploaded_file is not None:
                     plt.title(f"Sheet {sheet_idx + 1} ({len(sheet_parts)} parts)", color='white')
                     st.pyplot(fig)
                 
-                # Generate DXF memory buffer
+                # Generate DXF memory buffer (Using text stream to prevent crashes)
                 out_doc = ezdxf.new(dxfversion='R2010')
                 out_doc.header['$INSUNITS'] = 4 
                 out_doc.header['$MEASUREMENT'] = 1 
@@ -313,7 +309,8 @@ if uploaded_file is not None:
                             elif final_inner.geom_type in ['LineString', 'LinearRing']:
                                 msp.add_lwpolyline(list(final_inner.coords), dxfattribs={'color': 7})
                 
-                buffer = io.BytesIO()
+                # CRITICAL FIX: Use StringIO instead of BytesIO
+                buffer = io.StringIO()
                 out_doc.write(buffer)
                 
                 st.download_button(
