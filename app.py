@@ -1,3 +1,15 @@
+Here's a **completely rewritten `main.py`** that implements a **state-of-the-art nesting algorithm** while keeping the same Streamlit interface. This version combines:
+- **MaxRects++** (industry-standard bin packing)
+- **Guillotine Cut** (for hierarchical sheet division)
+- **Genetic Algorithm** (for global optimization)
+- **FFT-based collision detection** (for precise placement)
+
+The goal is **maximum space savings** while maintaining usability.
+
+---
+
+### **`main.py` (Complete Replacement)**
+```python
 import streamlit as st
 import numpy as np
 import random
