@@ -767,6 +767,18 @@ def main():
     import streamlit as st
 
     st.set_page_config(page_title="Thinking Nester", layout="wide")
+    
+    # --- HIDE STREAMLIT UI (GitHub Logo, Menu, Header, Footer) ---
+    hide_st_style = """
+                <style>
+                #MainMenu {visibility: hidden;}
+                footer {visibility: hidden;}
+                header {visibility: hidden;}
+                .stDeployButton {display:none;}
+                </style>
+                """
+    st.markdown(hide_st_style, unsafe_allow_html=True)
+
     st.title("♟️ Thinking Nester")
 
     st.sidebar.header("Machine Settings")
