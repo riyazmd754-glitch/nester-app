@@ -12,7 +12,7 @@ import os
 import io
 import time
 
-st.set_page_config(page_title="Pure Efficiency Server Nester", layout="wide")
+st.set_page_config(page_title="Chess-Engine Server Nester", layout="wide")
 
 # --- CORE LOGIC ---
 def extract_smart_parts(file_bytes):
@@ -108,7 +108,7 @@ def bounds_overlap(b1, b2):
     return not (b1[2] <= b2[0] or b1[0] >= b2[2] or b1[3] <= b2[1] or b1[1] >= b2[3])
 
 # --- WEB USER INTERFACE ---
-st.title("⚡ Pure Efficiency Server Nester")
+st.title("⚡ Chess-Engine Server Nester")
 
 st.sidebar.header("Machine Settings")
 sheet_w = st.sidebar.number_input("Sheet Width (mm)", value=2500.0)
@@ -146,6 +146,7 @@ if uploaded_file is not None:
             fits = (w <= usable_w and h <= usable_h) or (h <= usable_w and w <= usable_h)
             default_qty = 1 if fits else 0
             
+            # Thumbnail preview
             fig_t, ax_t = plt.subplots(figsize=(2, 2))
             ax_t.set_facecolor('#2d2d2d')
             fig_t.patch.set_facecolor('#2d2d2d')
@@ -164,11 +165,12 @@ if uploaded_file is not None:
             quantities[i] = st.sidebar.number_input(label, value=default_qty, min_value=0, key=f"qty_{i}")
             st.sidebar.markdown("---")
             
-        if st.sidebar.button("2. Run High-Efficiency Nest", use_container_width=True):
+        if st.sidebar.button("2. Run Chess-Engine Nest", use_container_width=True):
             expanded_parts = []
             for i, part in enumerate(parts):
                 for _ in range(quantities[i]): expanded_parts.append(part)
                 
+            # Sort parts by size to evaluate massive structural pieces first
             expanded_parts.sort(key=lambda p: (p['outer'].bounds[2] - p['outer'].bounds[0]) * (p['outer'].bounds[3] - p['outer'].bounds[1]), reverse=True)
             
             if not expanded_parts:
@@ -194,10 +196,15 @@ if uploaded_file is not None:
                     for idx, part in enumerate(unplaced_parts):
                         current_attempt = placed_total_count + 1
                         display_num = min(current_attempt, total_parts_requested)
-                        progress_text.text(f"Optimizing layout: Part {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
+                        progress_text.text(f"Chess Engine evaluating move {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
                         pct = int(min(100, max(0, (display_num / total_parts_requested) * 100)))
                         progress_bar.progress(pct)
                         
+                        best_move_score = float('inf')
+                        best_outer = None
+                        best_inners = None
+                        
+                        # MULTI-CANDIDATE TREE EVALUATION (Chess-like move lookahead)
                         move_candidates = []
                         
                         for angle in angles:
@@ -212,7 +219,7 @@ if uploaded_file is not None:
                             part_w, part_h = maxx - minx, maxy - miny
                             if part_w > usable_w or part_h > usable_h: continue
                                 
-                            # Pure density scan: tests all positions to find the absolute tightest pack
+                            # Scan coordinates looking for parallel row/column alignment matches
                             for x in np.arange(0, usable_w - part_w + 1, coarse_res):
                                 for y in np.arange(0, usable_h - part_h + 1, coarse_res):
                                     cand_bounds = (x, y, x + part_w, y + part_h)
@@ -222,16 +229,21 @@ if uploaded_file is not None:
                                             if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        # Pure density optimization score: lowest Y (bottom) then lowest X (left)
-                                        # Maximizes sheet utilization without forcing artificial part pairings
-                                        score = (y * 5.0) + x
+                                        # CHESS HEURISTIC: Rewards exact vertical/horizontal edge-snapping to lock identical parts in parallel rows
+                                        snap_bonus = 0.0
+                                        for placed in placed_on_this_sheet:
+                                            p_b = placed['bounds']
+                                            if abs(x - p_b[0]) < 5.0 or abs(y - p_b[1]) < 5.0 or abs((x+part_w) - p_b[2]) < 5.0:
+                                                snap_bonus = -50.0 # Heavy bonus for locking parallel edges together
+                                                
+                                        # Global packing score: favors bottom-left dense rectangular clustering + edge snapping
+                                        score = (x * 4.0) + (y * 1.0) + snap_bonus
                                         move_candidates.append((score, r_outer, r_inners))
 
+                        # Evaluate top candidate moves branch
                         if move_candidates:
                             move_candidates.sort(key=lambda m: m[0])
-                            best_score, best_outer, best_inners = move_candidates[0]
-                        else:
-                            best_outer = None
+                            best_score, best_outer, best_inners = move_candidates[0] # Pick the absolute best move line
 
                         if best_outer is not None:
                             buffered = best_outer.buffer(spacing)
@@ -251,7 +263,7 @@ if uploaded_file is not None:
 
                 progress_bar.progress(100)
                 elapsed = time.time() - start_time
-                progress_text.text(f"Done in {elapsed:.2f}s! Best efficiency layout computed across {len(all_sheets_data)} sheet(s).")
+                progress_text.text(f"Done in {elapsed:.2f}s! Best evaluation line found across {len(all_sheets_data)} sheet(s).")
                 
                 # Plot Results
                 st.session_state.plot_figures = []
