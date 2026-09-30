@@ -12,7 +12,7 @@ import os
 import io
 import time
 
-st.set_page_config(page_title="Chess-Engine Server Nester", layout="wide")
+st.set_page_config(page_title="High-Speed Server Nester", layout="wide")
 
 # --- CORE LOGIC ---
 def extract_smart_parts(file_bytes):
@@ -104,11 +104,44 @@ def extract_smart_parts(file_bytes):
         
     return parts
 
+def generate_part_thumbnail(part):
+    """Generates a small image thumbnail of the master part for the sidebar."""
+    fig, ax = plt.subplots(figsize=(2.5, 2.5))
+    ax.set_facecolor('#2d2d2d')
+    fig.patch.set_facecolor('#2d2d2d')
+    
+    # Draw outer boundary
+    x, y = part['outer'].exterior.xy
+    ax.plot(x, y, color='#4daafc', linewidth=1.5)
+    ax.fill(x, y, alpha=0.3, color='#4daafc')
+    
+    # Draw internal holes/cutouts
+    for inner in part['inners']:
+        if inner.geom_type == 'Polygon':
+            ix, iy = inner.exterior.xy
+            ax.plot(ix, iy, color='#111', linewidth=1)
+            ax.fill(ix, iy, color='#111')
+        elif inner.geom_type in ['LineString', 'LinearRing']:
+            ix, iy = inner.xy
+            ax.plot(ix, iy, color='#ff4444', linewidth=1)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_color('#444')
+        
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
 def bounds_overlap(b1, b2):
     return not (b1[2] <= b2[0] or b1[0] >= b2[2] or b1[3] <= b2[1] or b1[1] >= b2[3])
 
 # --- WEB USER INTERFACE ---
-st.title("⚡ Chess-Engine Server Nester")
+st.title("⚡ True Server-Side Nester")
 
 st.sidebar.header("Machine Settings")
 sheet_w = st.sidebar.number_input("Sheet Width (mm)", value=2500.0)
@@ -116,7 +149,7 @@ sheet_h = st.sidebar.number_input("Sheet Height (mm)", value=1250.0)
 spacing = st.sidebar.number_input("Part Spacing (mm)", value=3.0)
 margin = st.sidebar.number_input("Edge Margin (mm)", value=5.0)
 rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=4)
-coarse_res = st.sidebar.number_input("Grid Resolution (Precision)", value=10.0)
+coarse_res = st.sidebar.number_input("Grid Resolution", value=15.0)
 
 uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
 
@@ -138,7 +171,8 @@ if uploaded_file is not None:
         usable_h = sheet_h - (margin * 2)
         
         quantities = {}
-        st.sidebar.subheader("Thumbnails & Quantities")
+        st.sidebar.subheader("Detected Parts & Quantities")
+        
         for i, part in enumerate(parts):
             minx, miny, maxx, maxy = part['outer'].bounds
             w, h = round(maxx - minx, 1), round(maxy - miny, 1)
@@ -146,31 +180,20 @@ if uploaded_file is not None:
             fits = (w <= usable_w and h <= usable_h) or (h <= usable_w and w <= usable_h)
             default_qty = 1 if fits else 0
             
-            # Thumbnail preview
-            fig_t, ax_t = plt.subplots(figsize=(2, 2))
-            ax_t.set_facecolor('#2d2d2d')
-            fig_t.patch.set_facecolor('#2d2d2d')
-            tx, ty = part['outer'].exterior.xy
-            ax_t.plot(tx, ty, color='#4daafc', linewidth=1.5)
-            ax_t.fill(tx, ty, alpha=0.3, color='#4daafc')
-            ax_t.set_xticks([]); ax_t.set_yticks([])
-            for spine in ax_t.spines.values(): spine.set_color('#444')
-            buf_t = io.BytesIO()
-            plt.savefig(buf_t, format="png", bbox_inches='tight', facecolor=fig_t.get_facecolor(), edgecolor='none')
-            buf_t.seek(0); plt.close(fig_t)
-            st.sidebar.image(buf_t, use_container_width=True)
+            # Display Thumbnail in Sidebar
+            st.sidebar.image(generate_part_thumbnail(part), use_container_width=True)
             
             label = f"Part {i+1} ({w} x {h} mm)"
             if not fits: label += " ⚠️ Exceeds Sheet"
+            
             quantities[i] = st.sidebar.number_input(label, value=default_qty, min_value=0, key=f"qty_{i}")
             st.sidebar.markdown("---")
             
-        if st.sidebar.button("2. Run Chess-Engine Nest", use_container_width=True):
+        if st.sidebar.button("2. Run Server Nest", use_container_width=True):
             expanded_parts = []
             for i, part in enumerate(parts):
                 for _ in range(quantities[i]): expanded_parts.append(part)
                 
-            # Sort parts by size to evaluate massive structural pieces first
             expanded_parts.sort(key=lambda p: (p['outer'].bounds[2] - p['outer'].bounds[0]) * (p['outer'].bounds[3] - p['outer'].bounds[1]), reverse=True)
             
             if not expanded_parts:
@@ -196,16 +219,13 @@ if uploaded_file is not None:
                     for idx, part in enumerate(unplaced_parts):
                         current_attempt = placed_total_count + 1
                         display_num = min(current_attempt, total_parts_requested)
-                        progress_text.text(f"Chess Engine evaluating move {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
+                        progress_text.text(f"Nesting Part {display_num} of {total_parts_requested} (Sheet {current_sheet_idx})...")
                         pct = int(min(100, max(0, (display_num / total_parts_requested) * 100)))
                         progress_bar.progress(pct)
                         
-                        best_move_score = float('inf')
+                        best_score = float('inf')
                         best_outer = None
                         best_inners = None
-                        
-                        # MULTI-CANDIDATE TREE EVALUATION (Chess-like move lookahead)
-                        move_candidates = []
                         
                         for angle in angles:
                             origin = part['outer'].centroid
@@ -219,7 +239,9 @@ if uploaded_file is not None:
                             part_w, part_h = maxx - minx, maxy - miny
                             if part_w > usable_w or part_h > usable_h: continue
                                 
-                            # Scan coordinates looking for parallel row/column alignment matches
+                            coarse_best_x, coarse_best_y = None, None
+                            coarse_score = float('inf')
+
                             for x in np.arange(0, usable_w - part_w + 1, coarse_res):
                                 for y in np.arange(0, usable_h - part_h + 1, coarse_res):
                                     cand_bounds = (x, y, x + part_w, y + part_h)
@@ -229,28 +251,39 @@ if uploaded_file is not None:
                                             if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        # CHESS HEURISTIC: Rewards exact vertical/horizontal edge-snapping to lock identical parts in parallel rows
-                                        snap_bonus = 0.0
+                                        score = (x * 3.0) + y 
+                                        if score < coarse_score:
+                                            coarse_score = score
+                                            coarse_best_x, coarse_best_y = x, y
+
+                            if coarse_best_x is not None:
+                                start_x = max(0, coarse_best_x - coarse_res)
+                                end_x = min(usable_w - part_w, coarse_best_x + coarse_res)
+                                start_y = max(0, coarse_best_y - coarse_res)
+                                end_y = min(usable_h - part_h, coarse_best_y + coarse_res)
+
+                                for fx in np.arange(start_x, end_x + 1, 2.0):
+                                    for fy in np.arange(start_y, end_y + 1, 2.0):
+                                        cand_bounds = (fx, fy, fx + part_w, fy + part_h)
+                                        collision = False
                                         for placed in placed_on_this_sheet:
-                                            p_b = placed['bounds']
-                                            if abs(x - p_b[0]) < 5.0 or abs(y - p_b[1]) < 5.0 or abs((x+part_w) - p_b[2]) < 5.0:
-                                                snap_bonus = -50.0 # Heavy bonus for locking parallel edges together
-                                                
-                                        # Global packing score: favors bottom-left dense rectangular clustering + edge snapping
-                                        score = (x * 4.0) + (y * 1.0) + snap_bonus
-                                        move_candidates.append((score, r_outer, r_inners))
-
-                        # Evaluate top candidate moves branch
-                        if move_candidates:
-                            move_candidates.sort(key=lambda m: m[0])
-                            best_score, best_outer, best_inners = move_candidates[0] # Pick the absolute best move line
-
-                        if best_outer is not None:
+                                            if bounds_overlap(cand_bounds, placed['bounds']):
+                                                if placed['prep_buffered'].intersects(translate(r_outer, xoff=fx, yoff=fy)):
+                                                    collision = True; break
+                                        if not collision:
+                                            score = (fx * 3.0) + fy 
+                                            if score < best_score:
+                                                best_score = score
+                                                best_outer = translate(r_outer, xoff=fx, yoff=fy)
+                                                best_inners = [translate(inner, xoff=fx, yoff=fy) for inner in r_inners]
+                                        
+                        if best_outer:
                             buffered = best_outer.buffer(spacing)
                             placed_on_this_sheet.append({
-                                'outer': best_outer, 'inners': best_inners,
+                                'outer': best_outer, 'inners': inner_poly if 'inner_poly' in locals() else best_inners,
                                 'buffered': buffered, 'bounds': buffered.bounds,
-                                'prep_buffered': prep(buffered)
+                                'prep_buffered': prep(buffered),
+                                'inners': best_inners
                             })
                             sheet_is_empty = False
                             placed_total_count += 1
@@ -263,7 +296,7 @@ if uploaded_file is not None:
 
                 progress_bar.progress(100)
                 elapsed = time.time() - start_time
-                progress_text.text(f"Done in {elapsed:.2f}s! Best evaluation line found across {len(all_sheets_data)} sheet(s).")
+                progress_text.text(f"Done in {elapsed:.2f}s! Nested across {len(all_sheets_data)} sheet(s).")
                 
                 # Plot Results
                 st.session_state.plot_figures = []
