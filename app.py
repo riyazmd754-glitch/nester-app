@@ -116,7 +116,7 @@ sheet_h = st.sidebar.number_input("Sheet Height (mm)", value=1250.0)
 spacing = st.sidebar.number_input("Part Spacing (mm)", value=3.0)
 margin = st.sidebar.number_input("Edge Margin (mm)", value=5.0)
 rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=4)
-coarse_res = st.sidebar.number_input("Grid Resolution", value=25.0)
+coarse_res = st.sidebar.number_input("Grid Resolution", value=20.0)
 
 uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
 
@@ -174,7 +174,6 @@ if uploaded_file is not None:
                     current_sheet_idx = len(all_sheets_data) + 1
                     placed_on_this_sheet = []
                     failed_parts = []
-                    max_search_y = 0.0 
                     sheet_is_empty = True 
                     
                     angles = [i * (360.0 / rotations) for i in range(rotations)]
@@ -202,25 +201,24 @@ if uploaded_file is not None:
                             part_w, part_h = maxx - minx, maxy - miny
                             if part_w > usable_w or part_h > usable_h: continue
                                 
-                            limit_y = min(usable_h - part_h, max_search_y + part_h + 100)
                             coarse_best_x, coarse_best_y = None, None
                             coarse_score = float('inf')
 
+                            # DENSE CORNER SEARCH: Scans entire sheet to catch gaps & upper pockets
                             for x in np.arange(0, usable_w - part_w + 1, coarse_res):
-                                for y in np.arange(0, limit_y + 1, coarse_res):
+                                for y in np.arange(0, usable_h - part_h + 1, coarse_res):
                                     cand_bounds = (x, y, x + part_w, y + part_h)
                                     collision = False
                                     for placed in placed_on_this_sheet:
                                         if bounds_overlap(cand_bounds, placed['bounds']):
-                                            # HIGH-SPEED INDEX CHECK (PREP)
                                             if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        score = y + x 
+                                        # HIGH-EFFICIENCY CORNER SCORING (Prioritizes absolute bottom-left, fills pockets)
+                                        score = (y * 2.0) + x 
                                         if score < coarse_score:
                                             coarse_score = score
                                             coarse_best_x, coarse_best_y = x, y
-                                        break 
 
                             if coarse_best_x is not None:
                                 start_x = max(0, coarse_best_x - coarse_res)
@@ -234,25 +232,22 @@ if uploaded_file is not None:
                                         collision = False
                                         for placed in placed_on_this_sheet:
                                             if bounds_overlap(cand_bounds, placed['bounds']):
-                                                # HIGH-SPEED INDEX CHECK (PREP)
                                                 if placed['prep_buffered'].intersects(translate(r_outer, xoff=fx, yoff=fy)):
                                                     collision = True; break
                                         if not collision:
-                                            score = fy + fx 
+                                            score = (fy * 2.0) + fx 
                                             if score < best_score:
                                                 best_score = score
                                                 best_outer = translate(r_outer, xoff=fx, yoff=fy)
                                                 best_inners = [translate(inner, xoff=fx, yoff=fy) for inner in r_inners]
-                                            break
                                         
                         if best_outer:
                             buffered = best_outer.buffer(spacing)
                             placed_on_this_sheet.append({
                                 'outer': best_outer, 'inners': best_inners,
                                 'buffered': buffered, 'bounds': buffered.bounds,
-                                'prep_buffered': prep(buffered) # COMPILES SHAPE TO C++ SPATIAL INDEX FOR EXTREME SPEED
+                                'prep_buffered': prep(buffered)
                             })
-                            max_search_y = max(max_search_y, buffered.bounds[3])
                             sheet_is_empty = False
                             placed_total_count += 1
                         else:
@@ -313,11 +308,8 @@ if uploaded_file is not None:
                 
                 buffer = io.StringIO()
                 out_doc.write(buffer)
-                
-                # CACHE THE RESULTS SO THEY DON'T DISAPPEAR
                 st.session_state.dxf_output = buffer.getvalue()
 
-        # ALWAYS SHOW PLOTS AND DOWNLOAD BUTTON IF THEY EXIST IN MEMORY
         if "plot_figures" in st.session_state:
             for fig in st.session_state.plot_figures:
                 st.pyplot(fig)
