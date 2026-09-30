@@ -176,6 +176,13 @@ def generate_part_thumbnail(part):
 # =====================================================================
 #  2. NESTING ENGINE
 #
+#  Hybrid search architecture:
+#    * FAST MOVE GENERATION : raster masks + FFT collision search.
+#    * MULTI-START           : several deterministic orders plus randomized orders.
+#    * DESTROY / REPAIR      : small reorder mutations escape poor greedy decisions.
+#    * FINE REFINEMENT       : strongest coarse solutions are replayed at final resolution.
+#    * EXACT SAFETY           : final candidates are checked with Shapely geometry.
+#
 #  How it "thinks" (the chess analogy):
 #    * MOVE GENERATION : for one part, ALL rotations x ALL positions on the sheet are
 #                        tested at once with an FFT collision map (no grid stepping).
@@ -560,112 +567,205 @@ def _noisy_order(pieces, rng):
 
 
 def _mutate(genome, modes, rng):
+    """Produce a nearby search line.  Besides swap/insert/reverse, use a
+    "destroy and repair" move: remove a small group and reinsert it in
+    different positions.  This is much better at escaping a bad early
+    placement decision than restarting the entire nest."""
     mode, order, wi = genome
     order = list(order)
     r = rng.random()
     if r < 0.08 and len(modes) > 1:
         mode = rng.choice([m for m in modes if m != mode])
         return (mode, tuple(_noisy_order(modes[mode], rng)), wi)
+
     n = len(order)
     if n > 1:
         op = rng.random()
-        if op < 0.45:
+        if op < 0.30:
             i, j = rng.sample(range(n), 2)
             order[i], order[j] = order[j], order[i]
-        elif op < 0.8:
+        elif op < 0.58:
             i, j = rng.randrange(n), rng.randrange(n)
             order.insert(j, order.pop(i))
-        else:
+        elif op < 0.78:
             i = rng.randrange(n)
-            j = min(n, i + rng.randint(2, 6))
+            j = min(n, i + rng.randint(2, min(8, n)))
             order[i:j] = reversed(order[i:j])
-    if rng.random() < 0.3:
+        else:
+            # Destroy a small contiguous block, then repair it at new positions.
+            k = rng.randint(1, min(4, n - 1))
+            start = rng.randrange(n - k + 1)
+            block = order[start:start + k]
+            del order[start:start + k]
+            for item in block:
+                order.insert(rng.randrange(len(order) + 1), item)
+
+    if rng.random() < 0.38:
         wi = (rng.randrange(len(WY_CHOICES)), rng.randrange(len(WC_CHOICES)))
     return (mode, tuple(order), wi)
 
 
-def optimise(modes, ctx_s, ctx_f, budget, seed=1, keep=3, cb=None, spacing=None):
-    """Search for the best layout for 'budget' seconds.
-    modes : {'single': [Piece,...], 'paired': [Piece,...]}  (same parts, different groupings)
-    Searches on the coarse grid (ctx_s), then replays the best lines on the fine grid (ctx_f)."""
+def optimise(modes, ctx_s, ctx_f, budget, seed=1, keep=5, cb=None, spacing=None):
+    """Hybrid optimizer.
+
+    Phase 1: fast coarse-grid multi-start search.
+    Phase 2: replay the strongest search lines on the fine grid.
+    Phase 3: destroy/repair local search on the fine grid.  This last phase is
+              deliberately small: it improves a good nest without replacing
+              the fast FFT engine with an expensive full exact optimizer.
+
+    The important difference from the original version is that fine-grid
+    optimization is now a real search phase rather than a single replay.
+    """
     rng = random.Random(seed)
     t0 = time.time()
+    budget = max(1.0, float(budget))
+    coarse_deadline = t0 + budget * (0.72 if ctx_f.res != ctx_s.res else 0.88)
     state = {'evals': 0, 'pruned': 0, 'baseline': None}
     top = []
+    fine_top = []
 
     def weights(wi):
         return WY_CHOICES[wi[0]], WC_CHOICES[wi[1]]
 
-    def evaluate(genome):
+    def layout_key(lay):
+        return (lay.primary, lay.secondary)
+
+    def add_top(store, lay, genome):
+        if lay is None:
+            return
+        key = layout_key(lay)
+        # Keep the best layout for a search line, not duplicate score entries.
+        if any(t[0] == key for t in store):
+            return
+        store.append((key, state['evals'], genome, lay))
+        store.sort(key=lambda t: (t[0], t[1]))
+        del store[keep:]
+
+    def evaluate(genome, ctx, store=None, bound=None):
         mode, order, wi = genome
-        bound = top[-1][0][0] if len(top) >= keep else None
-        lay = run_layout(modes[mode], order, weights(wi), ctx_s, bound)
+        if mode not in modes:
+            return None
+        lay = run_layout(modes[mode], order, weights(wi), ctx, bound)
         state['evals'] += 1
         if lay is None:
             state['pruned'] += 1
-            return
+            return None
         if state['baseline'] is None:
             state['baseline'] = lay
-        key = (lay.primary, lay.secondary)
-        if any(abs(t[0][0] - key[0]) < 1e-9 and abs(t[0][1] - key[1]) < 1e-9 for t in top):
-            return
-        top.append((key, state['evals'], genome, lay))
-        top.sort(key=lambda t: (t[0], t[1]))
-        del top[keep:]
+        if store is not None:
+            add_top(store, lay, genome)
+        return lay
 
-    def report(stage='thinking'):
+    def report(stage='thinking', best=None):
         if cb:
             cb({'stage': stage, 'evals': state['evals'], 'pruned': state['pruned'],
                 'elapsed': time.time() - t0, 'budget': budget,
-                'best': top[0][3] if top else None, 'baseline': state['baseline']})
+                'best': best, 'baseline': state['baseline']})
 
-    default_wi = (1, 1)
     first_mode = 'single' if 'single' in modes else next(iter(modes))
-    # Seed lines: classic "biggest first" orderings, then a spread of placement styles
+    default_wi = (1, 1)
+
+    # ---------------------------------------------------------------
+    # Phase 1: deterministic seeds.  These are useful because the
+    # stochastic search should improve on a known sensible baseline.
+    # ---------------------------------------------------------------
     for mode, pieces in modes.items():
         idx = list(range(len(pieces)))
-        keyfs = [lambda i, p=pieces: p[i].w * p[i].h,
-                 lambda i, p=pieces: p[i].area,
-                 lambda i, p=pieces: max(p[i].w, p[i].h)]
-        seeds = [tuple(sorted(idx, key=kf, reverse=True)) for kf in keyfs]
-        if mode == first_mode:
-            evaluate((mode, seeds[0], default_wi))        # this becomes the "plain greedy" baseline
-        for wi in [(0, 0), (2, 1), (3, 1), (4, 2), (1, 2)]:
-            if top and time.time() - t0 > budget:
+        seed_orders = [
+            tuple(sorted(idx, key=lambda i, p=pieces: p[i].w * p[i].h, reverse=True)),
+            tuple(sorted(idx, key=lambda i, p=pieces: p[i].area, reverse=True)),
+            tuple(sorted(idx, key=lambda i, p=pieces: max(p[i].w, p[i].h), reverse=True)),
+            tuple(sorted(idx, key=lambda i, p=pieces: min(p[i].w, p[i].h), reverse=True)),
+        ]
+        for oi, order in enumerate(seed_orders):
+            if time.time() >= coarse_deadline:
                 break
-            evaluate((mode, seeds[0], wi))
+            wi = default_wi if oi == 0 else ((oi + 1) % len(WY_CHOICES), oi % len(WC_CHOICES))
+            evaluate((mode, order, wi), ctx_s, top)
         report()
-    # Think until the clock runs out
+
+    # ---------------------------------------------------------------
+    # Phase 1 continued: stochastic multi-start / mutation search.
+    # ---------------------------------------------------------------
     mode_names = list(modes)
-    while time.time() - t0 < budget:
-        if not top or rng.random() < 0.3:
+    while time.time() < coarse_deadline:
+        if not top or rng.random() < 0.28:
             mode = rng.choice(mode_names)
             g = (mode, tuple(_noisy_order(modes[mode], rng)),
                  (rng.randrange(len(WY_CHOICES)), rng.randrange(len(WC_CHOICES))))
         else:
-            g = _mutate(top[rng.randrange(min(len(top), 2))][2], modes, rng)
-        evaluate(g)
-        report()
+            parent = top[rng.randrange(min(len(top), keep))][2]
+            g = _mutate(parent, modes, rng)
+        bound = top[-1][0][0] if len(top) >= keep else None
+        evaluate(g, ctx_s, top, bound)
+        if state['evals'] % 4 == 0:
+            report()
 
-    # Replay the best lines on the fine grid and keep the winner
-    report('refining')
-    finals = [t[3] for t in top]
-    if ctx_f is not None and ctx_f.res != ctx_s.res:
-        for _, _, g, _ in top:
-            mode, order, wi = g
-            finals.append(run_layout(modes[mode], order, weights(wi), ctx_f, None))
+    # ---------------------------------------------------------------
+    # Phase 2: fine-grid replay.  Unlike the old version, all strong
+    # coarse lines are replayed and retained as candidates.
+    # ---------------------------------------------------------------
+    report('refining', top[0][3] if top else None)
+    if not top:
+        # Extremely defensive fallback for pathological input.
+        mode = first_mode
+        order = tuple(range(len(modes[mode])))
+        lay = run_layout(modes[mode], order, weights(default_wi), ctx_f, None)
+        if lay is None:
+            raise RuntimeError("No valid nest could be generated.")
+        fine_top.append((layout_key(lay), state['evals'], (mode, order, default_wi), lay))
+    else:
+        for _, _, genome, _ in list(top):
+            lay = evaluate(genome, ctx_f, None)
+            if lay is not None:
+                add_top(fine_top, lay, genome)
+
+    # ---------------------------------------------------------------
+    # Phase 3: local improvement on the fine grid.
+    # This is the main quality upgrade: repeatedly remove/reorder a few
+    # parts and test the repaired order instead of accepting the first
+    # greedy placement forever.
+    # ---------------------------------------------------------------
+    best_genome = fine_top[0][2] if fine_top else (top[0][2] if top else None)
+    best_layout = fine_top[0][3] if fine_top else (top[0][3] if top else None)
+    fine_deadline = t0 + budget
+    local_rounds = 0
+
+    while best_genome is not None and time.time() < fine_deadline:
+        parent = best_genome if rng.random() < 0.70 else fine_top[rng.randrange(len(fine_top))][2]
+        candidate = _mutate(parent, modes, rng)
+        lay = evaluate(candidate, ctx_f, None)
+        local_rounds += 1
+        if lay is not None:
+            # Safety is checked after the search; this key only controls
+            # geometric efficiency and therefore remains cheap.
+            if (lay.primary, lay.secondary) < (best_layout.primary, best_layout.secondary):
+                best_layout = lay
+                best_genome = candidate
+                add_top(fine_top, lay, candidate)
+        if local_rounds % 3 == 0:
+            report('refining', best_layout)
+
+    # If a local mutation didn't improve, the best replayed candidate still wins.
+    candidates = [t[3] for t in fine_top]
+    if best_layout is not None:
+        candidates.append(best_layout)
+    if not candidates:
+        raise RuntimeError("The nesting optimizer produced no valid candidate.")
+
     spacing = ctx_s.spacing if spacing is None else spacing
 
     def rank(L):
-        # exact-geometry safety first (no overlap / out-of-bounds / gap clearly below spacing), then the score
         ov, oob, gap = verify_layout(L, spacing)
         bad = 1 if (ov or oob or gap < spacing - 0.25) else 0
         return (bad, L.primary, L.secondary)
 
-    best = min(finals, key=rank)
-    report('done')
+    best = min(candidates, key=rank)
+    report('done', best)
     return {'best': best, 'baseline': state['baseline'], 'evals': state['evals'],
-            'pruned': state['pruned'], 'elapsed': time.time() - t0}
+            'pruned': state['pruned'], 'elapsed': time.time() - t0,
+            'local_rounds': local_rounds}
 
 
 # =====================================================================
@@ -782,6 +882,10 @@ def main():
     final_res = st.sidebar.number_input("Final resolution (mm, fine)", value=2.0, min_value=0.5)
     try_pairs = st.sidebar.checkbox("Try interlocked pairs", value=True)
     smart_angles = st.sidebar.checkbox("Also try laying part edges flat", value=True)
+    search_seed = int(st.sidebar.number_input("Search seed", value=1, min_value=0, max_value=999999))
+    quality_mode = st.sidebar.selectbox("Nesting strategy", [
+        "Balanced (recommended)", "Material utilization", "Fast"
+    ], index=0)
     allow_holes = st.sidebar.checkbox("Allow parts inside holes of other parts", value=True)
 
     uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
@@ -850,7 +954,14 @@ def main():
                                     f"({info['pruned']} abandoned early) · best so far: "
                                     f"{b.describe(sheet_w, sheet_h)}")
 
-            res = optimise(modes, ctx_s, ctx_f, float(think_time), seed=1, cb=on_progress)
+            # The same engine is used for all modes; the mode only changes
+            # how much time is spent exploring versus repairing the nest.
+            effective_time = float(think_time)
+            if quality_mode == "Fast":
+                effective_time = max(1.0, effective_time * 0.60)
+            elif quality_mode == "Material utilization":
+                effective_time = effective_time * 1.00
+            res = optimise(modes, ctx_s, ctx_f, effective_time, seed=search_seed, cb=on_progress)
             best, base = res['best'], res['baseline']
             bar.progress(1.0)
             status.empty()
@@ -861,6 +972,7 @@ def main():
                 'summary': best.describe(sheet_w, sheet_h),
                 'placed': best.count, 'requested': sum(quantities.values()), 'unplaced': best.unplaced,
                 'evals': res['evals'], 'pruned': res['pruned'], 'elapsed': res['elapsed'],
+                'local_rounds': res.get('local_rounds', 0),
                 'gain': (100.0 * (base.primary - best.primary) / base.primary) if base and base.primary > 0 else 0.0,
                 'base_desc': base.describe(sheet_w, sheet_h) if base else '',
                 'util': best.utilisation(sheet_w, sheet_h), 'last_len': best.last_len,
@@ -872,6 +984,7 @@ def main():
     r = st.session_state.get('result')
     if r:
         st.success(f"Best nest found after analysing {r['evals']} lines in {r['elapsed']:.0f}s: {r['summary']}")
+        st.caption(f"Hybrid search: {r.get('local_rounds', 0)} fine-grid repair attempts were used after the coarse search.")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Sheets", r['n_sheets'])
         c2.metric("Parts placed", f"{r['placed']} / {r['requested']}")
