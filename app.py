@@ -116,7 +116,7 @@ sheet_h = st.sidebar.number_input("Sheet Height (mm)", value=1250.0)
 spacing = st.sidebar.number_input("Part Spacing (mm)", value=3.0)
 margin = st.sidebar.number_input("Edge Margin (mm)", value=5.0)
 rotations = st.sidebar.number_input("Rotations (4=90°, 8=45°)", value=4)
-coarse_res = st.sidebar.number_input("Grid Resolution", value=20.0)
+coarse_res = st.sidebar.number_input("Grid Resolution", value=15.0)
 
 uploaded_file = st.sidebar.file_uploader("1. Upload DXF", type=['dxf'])
 
@@ -156,7 +156,8 @@ if uploaded_file is not None:
             for i, part in enumerate(parts):
                 for _ in range(quantities[i]): expanded_parts.append(part)
                 
-            expanded_parts.sort(key=lambda p: p['area'], reverse=True)
+            # Sort parts by perimeter/area ratio to group similar aspect ratios together into clean blocks
+            expanded_parts.sort(key=lambda p: (p['outer'].bounds[2] - p['outer'].bounds[0]) * (p['outer'].bounds[3] - p['outer'].bounds[1]), reverse=True)
             
             if not expanded_parts:
                 st.warning("All quantities are 0.")
@@ -204,7 +205,7 @@ if uploaded_file is not None:
                             coarse_best_x, coarse_best_y = None, None
                             coarse_score = float('inf')
 
-                            # DENSE CORNER SEARCH: Scans entire sheet to catch gaps & upper pockets
+                            # SKYLINE RECTANGLE PACKER: Scans grid prioritizing low elevations and left columns
                             for x in np.arange(0, usable_w - part_w + 1, coarse_res):
                                 for y in np.arange(0, usable_h - part_h + 1, coarse_res):
                                     cand_bounds = (x, y, x + part_w, y + part_h)
@@ -214,8 +215,8 @@ if uploaded_file is not None:
                                             if placed['prep_buffered'].intersects(translate(r_outer, xoff=x, yoff=y)):
                                                 collision = True; break
                                     if not collision:
-                                        # HIGH-EFFICIENCY CORNER SCORING (Prioritizes absolute bottom-left, fills pockets)
-                                        score = (y * 2.0) + x 
+                                        # STRICT RECTANGULAR BLOCK SCORING: Forces compact columns, isolating waste to a single right-side block
+                                        score = (x * 3.0) + y 
                                         if score < coarse_score:
                                             coarse_score = score
                                             coarse_best_x, coarse_best_y = x, y
@@ -235,7 +236,7 @@ if uploaded_file is not None:
                                                 if placed['prep_buffered'].intersects(translate(r_outer, xoff=fx, yoff=fy)):
                                                     collision = True; break
                                         if not collision:
-                                            score = (fy * 2.0) + fx 
+                                            score = (fx * 3.0) + fy 
                                             if score < best_score:
                                                 best_score = score
                                                 best_outer = translate(r_outer, xoff=fx, yoff=fy)
