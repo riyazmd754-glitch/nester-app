@@ -1,0 +1,5 @@
+streamlit
+ezdxf
+shapely
+numpy
+matplotlib
